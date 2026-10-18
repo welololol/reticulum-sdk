@@ -218,6 +218,13 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     accept_link_requests: bool,
     prove_packets: bool,
     ratchet_secret: Option<StaticSecret>,
+    /// App data to include in announces when the caller passes none.
+    ///
+    /// Mirrors the reference implementation's `Destination.default_app_data`:
+    /// `announce()`/`path_response()` fall back to this when `app_data` is
+    /// `None`. That fallback is what makes a path response carry the same
+    /// information as a full announce — see `set_default_app_data`.
+    default_app_data: Option<Vec<u8>>,
 }
 
 impl<I: HashIdentity, D: Direction, T: Type> Destination<I, D, T> {
@@ -240,6 +247,11 @@ impl Destination<PrivateIdentity, Input, Single> {
         let mut packet_data = PacketDataBuffer::new();
         let pub_key = self.identity.as_identity().public_key_bytes();
         let verifying_key = self.identity.as_identity().verifying_key_bytes();
+
+        // Resolve once: the app data is written both inside the signed region
+        // and onto the wire afterwards, so the two must not be able to disagree
+        // (a signature computed over data that is then omitted is invalid).
+        let app_data = app_data.or(self.default_app_data.as_deref());
 
         packet_data
             .chain_write(self.desc.address_hash.as_slice())
@@ -312,6 +324,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             accept_link_requests: true,
             prove_packets: false,
             ratchet_secret: None,
+            default_app_data: None,
         }
     }
 
@@ -320,6 +333,28 @@ impl Destination<PrivateIdentity, Input, Single> {
         let public = PublicKey::from(&secret);
         self.desc.ratchet_public_key = Some(public.to_bytes());
         self.ratchet_secret = Some(secret);
+    }
+
+    /// Set the app data to announce when a caller does not supply any.
+    ///
+    /// The reference implementation attaches `default_app_data` to every
+    /// announce and path response the destination emits, and that matters for
+    /// more than cosmetics: an LXMF delivery destination publishes its display
+    /// name *and* the stamp cost it requires there. Without a default, this SDK
+    /// answered a path request for a locally-owned destination with an
+    /// app-data-less announce, so a client that had pruned the destination
+    /// could not re-learn those requirements from the path response.
+    ///
+    /// Call this whenever the app data changes (e.g. on a display-name edit).
+    /// An explicit `app_data` argument to [`announce`](Self::announce) or
+    /// [`path_response`](Self::path_response) always takes precedence.
+    pub fn set_default_app_data(&mut self, app_data: Option<Vec<u8>>) {
+        self.default_app_data = app_data;
+    }
+
+    /// The app data announced when the caller supplies none, if any.
+    pub fn default_app_data(&self) -> Option<&[u8]> {
+        self.default_app_data.as_deref()
     }
 
     pub fn announce<R: CryptoRng + ?Sized>(
@@ -456,6 +491,7 @@ impl Destination<Identity, Output, Single> {
             accept_link_requests: false,
             prove_packets: false,
             ratchet_secret: None,
+            default_app_data: None,
         }
     }
 
@@ -468,6 +504,7 @@ impl Destination<Identity, Output, Single> {
             accept_link_requests: false,
             prove_packets: false,
             ratchet_secret: None,
+            default_app_data: None,
         }
     }
 
@@ -542,6 +579,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             accept_link_requests: false,
             prove_packets: false,
             ratchet_secret: None,
+            default_app_data: None,
         }
     }
 }
@@ -612,6 +650,81 @@ mod tests {
         );
         assert_eq!(announce_packet.context, crate::packet::PacketContext::None);
         DestinationAnnounce::validate(&announce_packet).expect("announce validates");
+    }
+
+    /// The app data a path response carries has to match the destination's
+    /// regular announces, otherwise a peer that has just lost its path entry
+    /// cannot re-learn anything from it. The reference gets this by answering
+    /// with the destination's `default_app_data`; `None` must mean "use the
+    /// default", not "announce nothing".
+    #[test]
+    fn a_path_response_carries_the_default_app_data() {
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
+
+        let mut dest = SingleInputDestination::new(identity, DestinationName::new("test", "in"));
+        let app_data = b"some-app-data".to_vec();
+        dest.set_default_app_data(Some(app_data.clone()));
+
+        let packet = dest.path_response(&mut rng, None).expect("path response");
+        let (_, emitted) = DestinationAnnounce::validate(&packet).expect("validates");
+
+        assert_eq!(emitted, app_data.as_slice());
+    }
+
+    #[test]
+    fn an_explicit_app_data_overrides_the_default() {
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
+
+        let mut dest = SingleInputDestination::new(identity, DestinationName::new("test", "in"));
+        dest.set_default_app_data(Some(b"the-default".to_vec()));
+
+        let packet = dest
+            .announce(&mut rng, Some(b"explicit"))
+            .expect("announce");
+        let (_, emitted) = DestinationAnnounce::validate(&packet).expect("validates");
+
+        assert_eq!(emitted, b"explicit");
+    }
+
+    #[test]
+    fn the_default_app_data_can_be_set_and_cleared() {
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
+        let mut dest = SingleInputDestination::new(identity, DestinationName::new("test", "in"));
+
+        assert_eq!(dest.default_app_data(), None);
+        let bare = dest.announce(&mut rng, None).expect("announce");
+        let (_, emitted) = DestinationAnnounce::validate(&bare).expect("validates");
+        assert!(emitted.is_empty());
+
+        dest.set_default_app_data(Some(b"set".to_vec()));
+        assert_eq!(dest.default_app_data(), Some(&b"set"[..]));
+
+        // Clearing it must take effect, not leave a stale value behind.
+        dest.set_default_app_data(None);
+        assert_eq!(dest.default_app_data(), None);
+        let cleared = dest.announce(&mut rng, None).expect("announce");
+        let (_, emitted) = DestinationAnnounce::validate(&cleared).expect("validates");
+        assert!(emitted.is_empty());
+    }
+
+    /// The app data is written both inside the signed region and onto the wire.
+    /// If only the signature covered it, the announce would be unverifiable.
+    #[test]
+    fn a_default_app_data_announce_has_a_valid_signature() {
+        let mut rng = UnwrapErr(SysRng);
+        let identity = PrivateIdentity::new_from_rand(&mut rng);
+
+        let mut dest = SingleInputDestination::new(identity, DestinationName::new("test", "in"));
+        dest.set_default_app_data(Some(b"signed-app-data".to_vec()));
+
+        let packet = dest.announce(&mut rng, None).expect("announce");
+        let (validated, emitted) = DestinationAnnounce::validate(&packet).expect("validates");
+
+        assert_eq!(validated.desc.address_hash, dest.desc.address_hash);
+        assert_eq!(emitted, b"signed-app-data");
     }
 
     #[test]

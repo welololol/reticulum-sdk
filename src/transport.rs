@@ -4013,6 +4013,12 @@ async fn handle_path_request(
     if let Some(request) = handler.path_requests.decode(packet.data.as_slice()) {
         if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
             let mut rng = UnwrapErr(SysRng);
+            // No app data is passed, so the response carries the destination's
+            // `default_app_data` (see `Destination::set_default_app_data`) —
+            // matching the reference, which likewise answers a path request
+            // with the destination's own default app data rather than nothing.
+            // Without a default set, the path response tells the requester
+            // nothing that the destination's regular announces did not.
             let response = dest
                 .lock()
                 .await
@@ -6647,6 +6653,146 @@ mod tests {
             .expect("broadcast link packet message");
         assert_eq!(sent.tx_type, TxMessageType::Broadcast(None));
         let _ = iface;
+    }
+
+    /// A peer answers a path request for a destination it owns with a path
+    /// response, and the requester may only have that response to go on — its
+    /// own copy of the destination has typically just expired. If the response
+    /// omits the destination's app data, everything the peer published there is
+    /// lost for exactly as long as the path stays unknown. The reference
+    /// answers with the destination's `default_app_data`; this asserts we do
+    /// too.
+    #[tokio::test]
+    async fn a_path_request_for_a_local_destination_answers_with_its_default_app_data() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let mut dest = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("lxmf", "delivery"),
+        );
+        let app_data = b"display name and stamp cost".to_vec();
+        dest.set_default_app_data(Some(app_data.clone()));
+        let address = dest.desc.address_hash;
+
+        {
+            let mut h = handler.lock().await;
+            h.single_in_destinations
+                .insert(address, Arc::new(tokio::sync::Mutex::new(dest)));
+        }
+
+        // Path request payload: destination | requesting transport | tag.
+        let mut data = PacketDataBuffer::new();
+        data.chain_write(address.as_slice());
+        data.chain_write(AddressHash::new_from_rand(&mut rng).as_slice());
+        data.chain_write(&[0u8; 4]);
+        let path_request_dest = handler.lock().await.fixed_dest_path_requests;
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                context_flag: crate::packet::ContextFlag::Unset,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 0,
+            },
+            ifac: None,
+            destination: path_request_dest,
+            transport: None,
+            context: PacketContext::None,
+            data,
+        };
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_path_request(
+                &packet,
+                &mut h,
+                &mut pending,
+                AddressHash::new_from_rand(&mut rng),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            pending.messages.len(),
+            1,
+            "expected exactly one path response"
+        );
+        let response = &pending.messages[0].packet;
+        assert_eq!(response.context, PacketContext::PathResponse);
+        assert_eq!(response.destination, address);
+
+        let (_, emitted) =
+            DestinationAnnounce::validate(response).expect("path response validates");
+        assert_eq!(
+            emitted,
+            app_data.as_slice(),
+            "the path response must carry the destination's default app data"
+        );
+    }
+
+    /// Without a default set, the destination has nothing to publish, and the
+    /// path response must stay empty rather than invent content or fail.
+    #[tokio::test]
+    async fn a_path_request_without_a_default_app_data_still_answers() {
+        let transport = Transport::new(Default::default());
+        let handler = transport.get_handler();
+        let mut rng = UnwrapErr(SysRng);
+
+        let dest = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(&mut rng),
+            DestinationName::new("example_utilities", "no.appdata"),
+        );
+        let address = dest.desc.address_hash;
+
+        {
+            let mut h = handler.lock().await;
+            h.single_in_destinations
+                .insert(address, Arc::new(tokio::sync::Mutex::new(dest)));
+        }
+
+        let mut data = PacketDataBuffer::new();
+        data.chain_write(address.as_slice());
+        data.chain_write(AddressHash::new_from_rand(&mut rng).as_slice());
+        data.chain_write(&[0u8; 4]);
+        let path_request_dest = handler.lock().await.fixed_dest_path_requests;
+        let packet = Packet {
+            header: Header {
+                ifac_flag: IfacFlag::Open,
+                header_type: HeaderType::Type2,
+                context_flag: crate::packet::ContextFlag::Unset,
+                propagation_type: PropagationType::Transport,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 0,
+            },
+            ifac: None,
+            destination: path_request_dest,
+            transport: None,
+            context: PacketContext::None,
+            data,
+        };
+
+        let mut pending = PendingSends::new();
+        {
+            let mut h = handler.lock().await;
+            handle_path_request(
+                &packet,
+                &mut h,
+                &mut pending,
+                AddressHash::new_from_rand(&mut rng),
+            )
+            .await;
+        }
+
+        assert_eq!(pending.messages.len(), 1);
+        let (_, emitted) = DestinationAnnounce::validate(&pending.messages[0].packet)
+            .expect("path response validates");
+        assert!(emitted.is_empty());
     }
 
     #[tokio::test]
