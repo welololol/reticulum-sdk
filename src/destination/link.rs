@@ -1438,6 +1438,16 @@ impl Link {
         self.status == LinkStatus::Pending && Instant::now() >= self.establishment_deadline
     }
 
+    /// Test-only: the deadline this out-link's establishment is bounded by.
+    ///
+    /// The deadline uses `std::time::Instant`, which Tokio's paused clock does
+    /// not virtualise, so a test cannot fast-forward to expiry and has to read
+    /// the value instead of waiting it out.
+    #[cfg(test)]
+    pub(crate) fn establishment_deadline(&self) -> Instant {
+        self.establishment_deadline
+    }
+
     /// Test-only: age the establishment anchor so the pending-link
     /// rediscovery logic can be exercised without sleeping.
     #[cfg(test)]

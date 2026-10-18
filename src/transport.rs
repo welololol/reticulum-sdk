@@ -74,6 +74,7 @@ use crate::packet::PacketContext;
 use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
 use crate::packet::PropagationType;
+use crate::packet::RETICULUM_MTU;
 
 mod announce_limits;
 mod announce_table;
@@ -153,6 +154,36 @@ pub const DEFAULT_RPC_CONTROL_PORT: u16 = 37429;
 pub const DEFAULT_RPC_BIND_HOST: &str = "127.0.0.1";
 pub const DEFAULT_INSTANCE_NAME: &str = "default";
 pub(crate) const DEFAULT_PER_HOP_TIMEOUT_SECS: u64 = 6;
+
+/// How long a full-size packet takes to leave via `bitrate`.
+///
+/// Mirrors the reference's `Transport.extra_link_proof_timeout()`:
+/// `((1 / bitrate) * 8) * MTU` — a packet of `MTU` bytes at `bitrate` bits per
+/// second takes `(MTU * 8) / bitrate` seconds to go out.
+fn transmission_time_secs(bitrate: f64) -> f64 {
+    if bitrate <= 0.0 || !bitrate.is_finite() {
+        return 0.0;
+    }
+    (RETICULUM_MTU as f64 * 8.0) / bitrate
+}
+
+/// Seconds for a full-size packet to leave over the first hop toward
+/// `destination`.
+///
+/// Mirrors the reference's `Transport.first_hop_timeout()` latency term. An
+/// unknown next hop, or an interface that does not report a bitrate, contributes
+/// nothing — which is exactly what the reference does when
+/// `next_hop_interface_bitrate()` returns `None`.
+fn first_hop_transmission_secs(ifaces: &InterfaceManager, first_hop: Option<AddressHash>) -> f64 {
+    let Some(address) = first_hop else {
+        return 0.0;
+    };
+    let Some(bitrate) = ifaces.interface_bitrate(&address) else {
+        return 0.0;
+    };
+    transmission_time_secs(bitrate)
+}
+
 const PY_CONN_CHALLENGE: &[u8] = b"#CHALLENGE#";
 const PY_CONN_WELCOME: &[u8] = b"#WELCOME#";
 const PY_CONN_FAILURE: &[u8] = b"#FAILURE#";
@@ -1360,17 +1391,31 @@ impl Transport {
         // that never receives its proof must eventually fail and be
         // removed, otherwise the application is stuck with a non-activating
         // link forever (matches Python's `Link.establishment_timeout`).
-        // The budget scales with the path hop count.
-        let establishment_hops = {
+        //
+        // The reference builds that budget from *two* terms:
+        //
+        //     first_hop_timeout(dest)          # MTU * latency + PER_HOP_TIMEOUT
+        //     + PER_HOP_TIMEOUT * max(1, hops)
+        //
+        // We were computing only the second, which drops the time a
+        // full-size packet needs just to leave over the next hop. On a fast
+        // link that is microseconds and nobody notices; on LoRa it is the
+        // dominant term (a ~366 bps SF12 link needs ~11 s to shift one MTU),
+        // and the link is torn down while the proof is still in flight.
+        let (establishment_hops, first_hop) = {
             let pt = self.send_ctx.path_table.read().unwrap();
-            pt.next_hop_route(&destination.address_hash)
+            let hops = pt
+                .next_hop_route(&destination.address_hash)
                 .map(|(_, _, hops)| hops)
                 .unwrap_or(1)
-                .max(1)
+                .max(1);
+            let iface = pt.next_hop_iface(&destination.address_hash);
+            (hops, iface)
         };
-        link.set_establishment_deadline(Duration::from_secs(
-            DEFAULT_PER_HOP_TIMEOUT_SECS * (establishment_hops as u64 + 1),
-        ));
+        let first_hop_secs =
+            first_hop_transmission_secs(&*self.send_ctx.iface_manager.lock().await, first_hop);
+        let per_hop = DEFAULT_PER_HOP_TIMEOUT_SECS * (establishment_hops as u64 + 1);
+        link.set_establishment_deadline(Duration::from_secs_f64(first_hop_secs + per_hop as f64));
 
         let packet = link.request(path_mtu);
 
@@ -2179,7 +2224,7 @@ fn handle_rpc_request(request: &Value, mut handler: Option<&mut TransportHandler
                 .map(|v| Value::from(v as i64))
                 .unwrap_or(Value::Nil),
             "packet_q" => Value::Nil,
-            "first_hop_timeout" => Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS),
+            "first_hop_timeout" => rpc_first_hop_timeout(map, handler.as_deref()),
             "link_count" => Value::from(0),
             "blackholed_identities" => rpc_blackholed_identities(handler.as_deref_mut()),
             "is_blackholed" => rpc_is_blackholed(map, handler.as_deref_mut()),
@@ -2420,6 +2465,43 @@ fn rpc_unblackhole_identity(
         );
     }
     Value::Boolean(removed)
+}
+
+/// Answer a `first_hop_timeout` request.
+///
+/// The reference answers this per destination
+/// (`{"get": "first_hop_timeout", "destination_hash": ...}`) and includes the
+/// time a full-size packet needs to leave over the next hop. We used to return
+/// a flat per-hop constant and ignored the destination entirely, so a Python
+/// client budgeting a link over a slow interface got a figure too small by the
+/// whole first-hop transmission time.
+fn rpc_first_hop_timeout(map: &[(Value, Value)], handler: Option<&TransportHandler>) -> Value {
+    let first_hop = handler.and_then(|handler| {
+        let destination = rpc_destination_hash(map)?;
+        handler
+            .send_ctx
+            .path_table
+            .read()
+            .unwrap()
+            .next_hop_iface(&destination)
+    });
+
+    // This runs on the synchronous RPC path, so the interface lock is taken
+    // opportunistically; if it is held, the latency term is skipped rather
+    // than blocking the RPC listener.
+    let latency = match handler.and_then(|h| h.send_ctx.iface_manager.try_lock().ok()) {
+        Some(ifaces) => first_hop_transmission_secs(&ifaces, first_hop),
+        None => 0.0,
+    };
+
+    // Kept as an integer when there is no latency term, so the encoding for the
+    // common case is unchanged; a float only appears where the reference would
+    // have produced one anyway.
+    if latency > 0.0 {
+        Value::from(latency + DEFAULT_PER_HOP_TIMEOUT_SECS as f64)
+    } else {
+        Value::from(DEFAULT_PER_HOP_TIMEOUT_SECS)
+    }
 }
 
 fn rpc_next_hop(map: &[(Value, Value)], handler: Option<&TransportHandler>) -> Value {
@@ -5806,6 +5888,21 @@ mod tests {
         }
     }
 
+    /// An interface that reports a fixed bitrate, standing in for a slow radio.
+    struct SlowIface {
+        bitrate: f64,
+    }
+
+    impl Interface for SlowIface {
+        fn hw_mtu(&self) -> usize {
+            254
+        }
+
+        fn bitrate(&self) -> Option<f64> {
+            Some(self.bitrate)
+        }
+    }
+
     fn free_local_ports(count: usize) -> Option<Vec<u16>> {
         let listeners = (0..count)
             .map(|_| StdTcpListener::bind("127.0.0.1:0").ok())
@@ -5995,6 +6092,141 @@ mod tests {
         assert!(!second.is_standalone_instance().await);
     }
 
+    /// A full-size packet takes `MTU * 8 / bitrate` seconds to leave.
+    #[test]
+    fn transmission_time_matches_the_reference_arithmetic() {
+        // 10 Mbit/s: sub-millisecond, so the per-hop constant dominates.
+        assert!(transmission_time_secs(10_000_000.0) < 0.001);
+        // ~366 bps, an SF12 LoRa link: the dominant term by a wide margin.
+        let lora = transmission_time_secs(366.0);
+        assert!((lora - 10.9).abs() < 0.2, "expected ~10.9s, got {lora}");
+        // Guards against a nonsense bitrate producing an infinite timeout.
+        assert_eq!(transmission_time_secs(0.0), 0.0);
+        assert_eq!(transmission_time_secs(-1.0), 0.0);
+        assert_eq!(transmission_time_secs(f64::NAN), 0.0);
+    }
+
+    /// The first-hop term exists so a slow first hop gets a bigger budget. With
+    /// no known next hop it contributes nothing, exactly as the reference does
+    /// when `next_hop_interface_bitrate()` returns `None`.
+    #[test]
+    fn a_destination_with_no_known_next_hop_has_no_latency_term() {
+        let ifaces = InterfaceManager::new(8);
+        assert_eq!(
+            first_hop_transmission_secs(&ifaces, None),
+            0.0,
+            "no next hop at all"
+        );
+        assert_eq!(
+            first_hop_transmission_secs(
+                &ifaces,
+                Some(AddressHash::new_from_rand(&mut UnwrapErr(SysRng)))
+            ),
+            0.0,
+            "a next hop whose interface is not registered"
+        );
+    }
+
+    /// The fix site itself: the budget a pending link actually gets must
+    /// include the first-hop transmission time.
+    ///
+    /// Asserted on the deadline rather than by waiting for expiry, because the
+    /// deadline is anchored to `std::time::Instant` and Tokio's paused clock
+    /// cannot advance it.
+    #[tokio::test]
+    async fn a_link_over_a_slow_first_hop_gets_a_wider_establishment_budget() {
+        let mut rng = UnwrapErr(SysRng);
+        let transport = Transport::new(TransportConfig::default());
+        let iface_manager = transport.iface_manager();
+        let slow_addr = {
+            let mut guard = iface_manager.lock().await;
+            guard.spawn(SlowIface { bitrate: 366.0 }, |_| async {})
+        };
+
+        // A destination reachable only over that slow interface, so the path
+        // table records it as the next hop.
+        let peer_identity = PrivateIdentity::new_from_rand(&mut rng);
+        let peer_destination =
+            SingleInputDestination::new(peer_identity, DestinationName::new("lxmf", "delivery"));
+        let announce = peer_destination
+            .announce(&mut rng, Some(&[0x90]))
+            .expect("valid announce");
+        {
+            let mut pending = PendingSends::new();
+            let handler = transport.get_handler();
+            let mut h = handler.lock().await;
+            handle_announce(&announce, &mut h, &mut pending, slow_addr, None, None).await;
+        }
+
+        // Measured from before the call, not after it: sending over a 366 bps
+        // interface is paced, so `link()` itself takes seconds of wall clock and
+        // a deadline measured afterwards would read short.
+        let desc = peer_destination.desc;
+        let started = std::time::Instant::now();
+        let link = transport.link(desc).await;
+        let deadline = link.lock().await.establishment_deadline();
+        let budget = deadline.saturating_duration_since(started);
+
+        // One hop over ~366 bps: 6 * (1 + 1) plus ~10.9s to shift one MTU.
+        // Before the fix this was 12s and the proof was abandoned mid-flight.
+        assert!(
+            budget >= Duration::from_secs(20),
+            "expected ~23s (12s per-hop + ~11s first hop), got {budget:?}"
+        );
+        assert!(
+            budget < Duration::from_secs(30),
+            "budget should stay bounded, got {budget:?}"
+        );
+    }
+
+    /// The wiring, not just the arithmetic: a registered slow interface must
+    /// actually contribute its transmission time, and a fast one must
+    /// contribute something negligible.
+    #[tokio::test]
+    async fn a_slow_first_hop_widens_the_link_establishment_budget() {
+        let slow = 366.0; // SF12 LoRa
+        let transport = Transport::new(TransportConfig::default());
+        let iface_manager = transport.iface_manager();
+        let slow_addr = {
+            let mut guard = iface_manager.lock().await;
+            guard.spawn(SlowIface { bitrate: slow }, |_| async {})
+        };
+
+        let slow_secs = {
+            let guard = iface_manager.lock().await;
+            first_hop_transmission_secs(&guard, Some(slow_addr))
+        };
+        assert!(
+            (slow_secs - 10.9).abs() < 0.2,
+            "a ~366 bps first hop needs ~10.9s to shift one MTU, got {slow_secs}"
+        );
+
+        // The budget it buys, for a two-hop path.
+        let hops = 2u8;
+        let budget = slow_secs + DEFAULT_PER_HOP_TIMEOUT_SECS as f64 * (hops as f64 + 1.0);
+        assert!(
+            budget > DEFAULT_PER_HOP_TIMEOUT_SECS as f64 * 3.0 + 10.0,
+            "budget {budget}s should exceed the old per-hop-only figure by ~11s"
+        );
+
+        // A fast interface barely moves it, which is why this was never noticed
+        // off the radio.
+        let fast_addr = {
+            let mut guard = iface_manager.lock().await;
+            guard.spawn(
+                SlowIface {
+                    bitrate: 10_000_000.0,
+                },
+                |_| async {},
+            )
+        };
+        let fast_secs = {
+            let guard = iface_manager.lock().await;
+            first_hop_transmission_secs(&guard, Some(fast_addr))
+        };
+        assert!(fast_secs < 0.001, "got {fast_secs}");
+    }
+
     #[tokio::test]
     async fn rpc_returns_first_hop_timeout() {
         let Some(ports) = free_local_ports(2) else {
@@ -6054,6 +6286,8 @@ mod tests {
             .await
             .expect("response frame");
         let response = read_rpc_value(&response).expect("decoded response");
+        // An unknown destination has no next hop and so no latency term, which
+        // leaves exactly the per-hop constant, encoded as before.
         assert_eq!(response.as_u64(), Some(DEFAULT_PER_HOP_TIMEOUT_SECS));
     }
 
