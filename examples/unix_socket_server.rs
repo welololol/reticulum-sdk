@@ -7,7 +7,7 @@ use reticulum::transport::{Transport, TransportConfig};
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
-    log::info!(">>> TCP SERVER APP <<<");
+    log::info!(">>> UNIX SERVER APP <<<");
 
     let transport = Transport::new(TransportConfig::new(
         "server",

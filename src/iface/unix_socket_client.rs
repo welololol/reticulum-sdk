@@ -68,7 +68,7 @@ impl UnixSocketClient {
             };
 
             if let Err(_) = stream {
-                log::info!("tcp_client: couldn't connect to <{}>", addr);
+                log::info!("unix_socker_client: couldn't connect to <{}>", addr);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -79,7 +79,7 @@ impl UnixSocketClient {
             let stream = stream.unwrap();
             let (read_stream, write_stream) = stream.into_split();
 
-            log::info!("tcp_client connected to <{}>", addr);
+            log::info!("unix_client connected to <{}>", addr);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
 
@@ -93,7 +93,7 @@ impl UnixSocketClient {
                 tokio::spawn(async move {
                     let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
                     let mut rx_buffer = [0u8; BUFFER_SIZE + (BUFFER_SIZE / 2)];
-                    let mut tcp_buffer = [0u8; (BUFFER_SIZE * 16)];
+                    let mut unix_socker_buffer = [0u8; (BUFFER_SIZE * 16)];
 
                     loop {
                         tokio::select! {
@@ -103,18 +103,18 @@ impl UnixSocketClient {
                             _ = stop.cancelled() => {
                                     break;
                             }
-                            result = stream.read(&mut tcp_buffer[..]) => {
+                            result = stream.read(&mut unix_socker_buffer[..]) => {
                                     match result {
                                         Ok(0) => {
-                                            log::warn!("tcp_client: connection closed");
+                                            log::warn!("unix_socker_client: connection closed");
                                             stop.cancel();
                                             break;
                                         }
                                         Ok(n) => {
-                                            // TCP stream may contain several or partial HDLC frames
+                                            // unix_socker stream may contain several or partial HDLC frames
                                             for i in 0..n {
                                                 // Push new byte from the end of buffer
-                                                rx_buffer[BUFFER_SIZE-1] = tcp_buffer[i];
+                                                rx_buffer[BUFFER_SIZE-1] = unix_socker_buffer[i];
 
                                                 // Check if it is contains a HDLC frame
                                                 let frame = Hdlc::find(&rx_buffer[..]);
@@ -125,14 +125,14 @@ impl UnixSocketClient {
                                                     if let Ok(_) = Hdlc::decode(frame_buffer, &mut output) {
                                                         if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
                                                             if PACKET_TRACE {
-                                                                log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
+                                                                log::trace!("unix_socker_client: rx << ({}) {}", iface_address, packet);
                                                             }
-                                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                                            let _ = rx_channel.send(RxMessage { address: iface_address, rssi: None, snr: None, packet: packet }).await;
                                                         } else {
-                                                            log::warn!("tcp_client: couldn't decode packet");
+                                                            log::warn!("unix_socker_client: couldn't decode packet");
                                                         }
                                                     } else {
-                                                        log::warn!("tcp_client: couldn't decode hdlc frame");
+                                                        log::warn!("unix_socker_client: couldn't decode hdlc frame");
                                                     }
 
                                                     // Remove current HDLC frame data
@@ -144,7 +144,7 @@ impl UnixSocketClient {
                                             }
                                         }
                                         Err(e) => {
-                                            log::warn!("tcp_client: connection error {}", e);
+                                            log::warn!("unix_socker_client: connection error {}", e);
                                             break;
                                         }
                                     }
@@ -181,7 +181,7 @@ impl UnixSocketClient {
                             Some(message) = tx_channel.recv() => {
                                 let packet = message.packet;
                                 if PACKET_TRACE {
-                                    log::trace!("tcp_client: tx >> ({}) {}", iface_address, packet);
+                                    log::trace!("unix_socker_client: tx >> ({}) {}", iface_address, packet);
                                 }
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
                                 if let Ok(_) = packet.serialize(&mut output) {
@@ -202,7 +202,7 @@ impl UnixSocketClient {
             tx_task.await.unwrap();
             rx_task.await.unwrap();
 
-            log::info!("tcp_client: disconnected from <{}>", addr);
+            log::info!("unix_socker_client: disconnected from <{}>", addr);
         }
 
         iface_stop.cancel();
@@ -210,7 +210,7 @@ impl UnixSocketClient {
 }
 
 impl Interface for UnixSocketClient {
-    fn mtu() -> usize {
+    fn hw_mtu(&self) -> usize {
         2048
     }
 }

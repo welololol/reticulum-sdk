@@ -37,16 +37,15 @@ impl UnixSocketServer {
                 break;
             }
 
-            let listener = UnixListener::bind(addr.clone())
-                .map_err(|_| RnsError::ConnectionError);
+            let listener = UnixListener::bind(addr.clone()).map_err(|_| RnsError::ConnectionError);
 
             if let Err(_) = listener {
-                log::warn!("tcp_server: couldn't bind to <{}>", addr);
+                log::warn!("unix_socker_server: couldn't bind to <{}>", addr);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
 
-            log::info!("tcp_server: listen on <{}>", addr);
+            log::info!("unix_socker_server: listen on <{}>", addr);
 
             let listener = listener.unwrap();
 
@@ -88,7 +87,7 @@ impl UnixSocketServer {
                     client = listener.accept() => {
                         if let Ok(client) = client {
                             log::info!(
-                                "tcp_server: new client <{:?}> connected to <{}>",
+                                "unix_socker_server: new client <{:?}> connected to <{}>",
                                 client.1,
                                 addr
                             );
@@ -110,7 +109,7 @@ impl UnixSocketServer {
 }
 
 impl Interface for UnixSocketServer {
-    fn mtu() -> usize {
+    fn hw_mtu(&self) -> usize {
         2048
     }
 }
