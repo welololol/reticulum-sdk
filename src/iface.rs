@@ -17,6 +17,8 @@ pub mod tcp_server;
 #[cfg(feature = "serial")]
 pub mod serial;
 pub mod udp;
+pub mod unix_socker_server;
+pub mod unix_socket_client;
 
 use std::sync::Arc;
 use std::sync::Mutex;
