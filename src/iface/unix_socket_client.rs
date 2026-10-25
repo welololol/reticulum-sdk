@@ -123,7 +123,6 @@ impl UnixSocketClient {
                                                     let frame_buffer = &mut rx_buffer[frame.0..frame.1+1];
                                                     let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
                                                     if let Ok(_) = Hdlc::decode(frame_buffer, &mut output) {
-                                                        println!("{:?}", output.as_slice());
                                                         if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
                                                             if PACKET_TRACE {
                                                                 log::trace!("unix_socker_client: rx << ({}) {}", iface_address, packet);
