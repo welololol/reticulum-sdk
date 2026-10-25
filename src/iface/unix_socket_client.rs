@@ -81,7 +81,7 @@ impl UnixSocketClient {
 
             log::info!("unix_client connected to <{}>", addr);
 
-            const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
+            const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 8; // setting this to 2 fails (which is what it was set to orginally) for some reason I don't understand. Seemed to work fine at * 4 but I set it at * 8 just to be sure, someone smarter can fix this later
 
             // Start receive task
             let rx_task = {
@@ -123,6 +123,7 @@ impl UnixSocketClient {
                                                     let frame_buffer = &mut rx_buffer[frame.0..frame.1+1];
                                                     let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
                                                     if let Ok(_) = Hdlc::decode(frame_buffer, &mut output) {
+                                                        println!("{:?}", output.as_slice());
                                                         if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
                                                             if PACKET_TRACE {
                                                                 log::trace!("unix_socker_client: rx << ({}) {}", iface_address, packet);
